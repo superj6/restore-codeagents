@@ -33,9 +33,16 @@ Matching uses the tab title. A guess happens when the title doesn't name the
 session: a Claude session that has no title yet ("Claude Code"), or a Codex
 thread without a name, whose tab shows only the folder name.
 
-Only Claude/Codex tabs are restored; plain shell tabs are skipped. A tab whose
-agent you exited normally (`/exit`, Ctrl-C) isn't restorable. Closed windows are
-kept for 14 days, and dropped as soon as their sessions are running again.
+Only Claude/Codex tabs are restored; plain shell tabs are skipped. After an
+agent exits (`/exit`, Ctrl-C), its tab must stay open at a shell for 30 seconds
+before it is forgotten. This grace period preserves sessions when agents exit
+just before their terminal windows close during shutdown. Pending tabs are
+saved throughout that period, including across watcher restarts and reboots.
+Named Codex tabs keep their association while their session title is unchanged.
+Closed windows are kept for 3 days, and dropped as soon as their sessions are
+running again. Expired windows are also removed when you run a command, even
+if the watcher is stopped. Cleanup only removes restore entries, not the
+underlying Claude/Codex conversation history.
 
 State lives in `~/.local/state/agent-restore/state.json`; watcher logs go to
 `journalctl --user -u agent-restore`.

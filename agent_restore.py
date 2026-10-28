@@ -40,9 +40,10 @@ UNIT_FILE = os.path.join(HOME, '.config', 'systemd', 'user', UNIT_NAME)
 BIN_LINK = os.path.join(HOME, '.local', 'bin', 'agent-restore')
 
 POLL_SECS = 3.0
-KEEP_SECS = 14 * 86400
+KEEP_SECS = 3 * 86400
 MERGE_SECS = 15         # tabs of one window that die a few polls apart land in one entry
 CLAUDE_GRACE_SECS = 30  # a vanished tab whose Claude process lives on was moved, not closed
+EXIT_GRACE_SECS = 30    # agents can exit before their terminal tabs disappear at shutdown
 
 # Flags worth carrying over to the resumed session.
 CLAUDE_VALUE_FLAGS = {'--model', '--permission-mode', '--add-dir'}
@@ -496,11 +497,14 @@ def state():
         st.setdefault('closed', [])
         st.setdefault('next_id', 0)
         before = json.dumps(st, sort_keys=True)
+        prune(st, set(), time.time())
         yield st
         if json.dumps(st, sort_keys=True) != before:
             tmp = STATE_FILE + '.tmp'
             with open(tmp, 'w') as f:
                 json.dump(st, f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, STATE_FILE)
 
 
@@ -528,18 +532,36 @@ class Watcher:
 
     def step(self, cur, live_claude, now, final):
         """Agent tabs that are confirmed closed since the last call."""
-        cur_tabs = {t['key'] for w in cur for t in w['tabs']}
+        cur_tabs = {t['key']: t for w in cur for t in w['tabs']}
         cur_sids = {t['agent']['session_id'] for w in cur for t in w['tabs'] if t['agent']}
         for w in self.layout:
             for i, t in enumerate(w['tabs']):
-                if t.get('agent') and t['key'] not in cur_tabs and t['key'] not in self.limbo:
-                    self.limbo[t['key']] = {'win': w, 'idx': i, 'tab': t, 'since': now}
+                current = cur_tabs.get(t['key'])
+                if (t.get('agent') and (current is None or not current.get('agent'))
+                        and t['key'] not in self.limbo):
+                    self.limbo[t['key']] = {'win': w, 'idx': i, 'tab': t,
+                                            'since': t.get('unmatched_since', now)}
         self.layout = cur
         ready = []
         for key, e in list(self.limbo.items()):
             sid = e['tab']['agent']['session_id']
-            if key in cur_tabs or sid in cur_sids:  # came back, or was moved to another window
+            current = cur_tabs.get(key)
+            if sid in cur_sids or (current is not None and current.get('agent')):
+                # Came back, moved, or this tab started a different session.
                 del self.limbo[key]
+            elif current is not None:
+                # Losing a process/title match isn't proof of a normal exit: at
+                # shutdown Codex can die while its tab still exists. Keep its
+                # last association until the tab closes or stays a shell long
+                # enough to confirm that the agent was exited intentionally.
+                a = e['tab']['agent']
+                if (a['tool'] == 'codex' and ' | ' in e['tab']['title']
+                        and current['title'] == e['tab']['title']):
+                    # An unchanged named Codex title still identifies the
+                    # session, even if its process disappeared first.
+                    e['since'] = now
+                elif now - e['since'] >= EXIT_GRACE_SECS:
+                    del self.limbo[key]
             elif sid in live_claude and not final:  # its process still runs, so the tab wasn't closed yet
                 if now - e['since'] > CLAUDE_GRACE_SECS:
                     del self.limbo[key]
@@ -551,10 +573,16 @@ class Watcher:
     def saved_layout(self):
         """The layout plus vanished tabs not yet confirmed closed, so that a watcher
         killed mid-confirmation (e.g. at logout) still finds them after a restart."""
-        pending = {}
+        windows = {w['key']: dict(w, tabs=list(w['tabs'])) for w in self.layout}
         for e in sorted(self.limbo.values(), key=lambda e: e['idx']):
-            pending.setdefault(e['win']['key'], dict(e['win'], tabs=[]))['tabs'].append(e['tab'])
-        return self.layout + list(pending.values())
+            w = windows.setdefault(e['win']['key'], dict(e['win'], tabs=[]))
+            tab = dict(e['tab'], unmatched_since=e['since'])
+            idx = next((i for i, t in enumerate(w['tabs']) if t['key'] == tab['key']), None)
+            if idx is None:
+                w['tabs'].insert(e['idx'], tab)
+            else:
+                w['tabs'][idx] = tab
+        return list(windows.values())
 
     @staticmethod
     def commit(st, ready, cur, now, reason):
