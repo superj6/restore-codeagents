@@ -44,6 +44,9 @@ KEEP_SECS = 3 * 86400
 MERGE_SECS = 15         # tabs of one window that die a few polls apart land in one entry
 CLAUDE_GRACE_SECS = 30  # a vanished tab whose Claude process lives on was moved, not closed
 EXIT_GRACE_SECS = 30    # agents can exit before their terminal tabs disappear at shutdown
+CODEX_START_ATTEMPTS = 3
+CODEX_START_SECS = 120  # retry early failures, not crashes after a long-running session
+CODEX_RETRY_SECS = 5
 
 # Flags worth carrying over to the resumed session.
 CLAUDE_VALUE_FLAGS = {'--model', '--permission-mode', '--add-dir'}
@@ -648,9 +651,25 @@ def resume_cmd(t):
     if t['tool'] == 'claude':
         argv = [shutil.which('claude') or 'claude', '--resume', t['session_id']]
     else:
-        argv = [shutil.which('codex') or 'codex', 'resume', t['session_id']]
+        argv = [sys.executable, os.path.realpath(__file__), '--retry-codex', t['session_id']]
     # Keep the tab open on a shell once the agent exits, like a normal tab.
     return shlex.join(['bash', '-c', shlex.join(argv + t.get('flags', [])) + '; exec "${SHELL:-bash}"'])
+
+
+def run_codex(sid, flags):
+    """Retry short failed starts with the real terminal attached throughout."""
+    argv = [shutil.which('codex') or 'codex', 'resume', sid, *flags]
+    for attempt in range(1, CODEX_START_ATTEMPTS + 1):
+        started = time.monotonic()
+        rc = subprocess.run(argv).returncode
+        elapsed = time.monotonic() - started
+        if (rc == 0 or rc < 0 or rc in (130, 137, 143) or elapsed >= CODEX_START_SECS
+                or attempt == CODEX_START_ATTEMPTS):
+            return rc
+        delay = CODEX_RETRY_SECS * attempt
+        print(f'Codex exited after {elapsed:.0f}s (status {rc}); retrying in {delay}s '
+              f'({attempt + 1}/{CODEX_START_ATTEMPTS}). Ctrl-C cancels.', flush=True)
+        time.sleep(delay)
 
 
 def terminal_argv(entry):
@@ -686,15 +705,15 @@ def restore(entries, dry):
     if env.get('GIT_EDITOR') == 'true' and 'CLAUDECODE' in os.environ:  # Claude's, not the user's
         del env['GIT_EDITOR']
     live = live_session_ids()
-    done = []
+    opened = False
+    already_running = False
     for c in entries:
         running = [t for t in c['tabs'] if t['session_id'] in live]
         for t in running:
             print(f"  skipping {t['tool']} '{t['title']}': already running", file=sys.stderr)
         c = dict(c, tabs=[t for t in c['tabs'] if t not in running])
         if not c['tabs']:
-            if not dry:
-                done.append(c['id'])
+            already_running = True
             continue
         argv = terminal_argv(c)
         if dry:
@@ -706,14 +725,15 @@ def restore(entries, dry):
         r = subprocess.run(argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         noise = [l for l in r.stderr.splitlines() if 'deprecated' not in l and 'Use “-- ”' not in l and l.strip()]
         if r.returncode == 0:
-            print(f"restored #{c['id']} ({len(c['tabs'])} tab{'s' * (len(c['tabs']) != 1)})")
-            done.append(c['id'])
+            print(f"opened #{c['id']} ({len(c['tabs'])} tab{'s' * (len(c['tabs']) != 1)}); "
+                  'saved until the sessions are detected running')
+            opened = True
         else:
             print(f"failed to restore #{c['id']}: {' '.join(noise) or r.returncode}", file=sys.stderr)
-    if done:
+    if not dry:
         with state() as st:
-            st['closed'] = [c for c in st['closed'] if c['id'] not in done]
-    return bool(done) or dry
+            prune(st, live, time.time())
+    return opened or already_running or dry
 
 
 def closed_entries():
@@ -856,6 +876,7 @@ def cmd_uninstall(args):
 def main():
     ap = argparse.ArgumentParser(prog='agent-restore', description=__doc__.split('\n\n')[0])
     ap.add_argument('--print', action='store_true', help='print the terminal commands instead of running them')
+    ap.add_argument('--retry-codex', nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest='cmd')
     sub.add_parser('list', help='show live and closed windows')
     for name, help_ in (('restore', 'restore closed windows'), ('forget', 'drop closed windows')):
@@ -866,9 +887,13 @@ def main():
     sub.add_parser('install', help='install the command and start the tracker service')
     sub.add_parser('uninstall', help='stop and remove the tracker service')
     args = ap.parse_args()
+    if args.retry_codex is not None and not args.retry_codex:
+        ap.error('--retry-codex requires a session ID')
     handler = {None: cmd_pick, 'list': cmd_list, 'restore': cmd_restore, 'forget': cmd_forget,
                'watch': cmd_watch, 'install': cmd_install, 'uninstall': cmd_uninstall}[args.cmd]
     try:
+        if args.retry_codex is not None:
+            return run_codex(args.retry_codex[0], args.retry_codex[1:])
         return handler(args)
     except KeyboardInterrupt:
         return 130

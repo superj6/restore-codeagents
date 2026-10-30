@@ -172,5 +172,104 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual([c['id'] for c in json.load(f)['closed']], [2])
 
 
+class RestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patches = patch.multiple(app, STATE_DIR=self.tmp.name,
+                                 STATE_FILE=os.path.join(self.tmp.name, 'state.json'),
+                                 LOCK_FILE=os.path.join(self.tmp.name, 'state.lock'))
+        patches.start()
+        self.addCleanup(patches.stop)
+        self.entry = {'id': 1, 'closed_at': app.time.time(),
+                      'tabs': [dict(tab('codex')['agent'], title='Codex'),
+                               dict(tab('claude', 'claude')['agent'], title='Claude')]}
+        with open(app.STATE_FILE, 'w') as f:
+            json.dump({'closed': [self.entry], 'next_id': 1}, f)
+
+    def restore(self, live=(), rc=0, dry=False):
+        result = app.subprocess.CompletedProcess([], rc, stderr='')
+        with patch.object(app, 'live_session_ids', return_value=set(live)), \
+                patch.object(app.subprocess, 'run', return_value=result) as run, \
+                patch.object(app.os.path, 'isdir', return_value=True), \
+                patch('builtins.print'):
+            restored = app.restore([self.entry], dry)
+        return restored, run
+
+    def saved_sids(self):
+        with open(app.STATE_FILE) as f:
+            return [t['session_id'] for c in json.load(f)['closed'] for t in c['tabs']]
+
+    def test_terminal_success_keeps_unconfirmed_sessions_restorable(self):
+        restored, run = self.restore()
+        self.assertTrue(restored)
+        run.assert_called_once()
+        self.assertEqual(self.saved_sids(), ['codex', 'claude'])
+
+    def test_partial_startup_only_removes_confirmed_sessions(self):
+        self.restore(live={'claude'})
+        self.assertEqual(self.saved_sids(), ['codex'])
+
+    def test_already_running_sessions_are_removed_without_opening_tabs(self):
+        restored, run = self.restore(live={'codex', 'claude'})
+        self.assertTrue(restored)
+        run.assert_not_called()
+        self.assertEqual(self.saved_sids(), [])
+
+    def test_terminal_launch_failure_keeps_saved_entries(self):
+        restored, _ = self.restore(rc=1)
+        self.assertFalse(restored)
+        self.assertEqual(self.saved_sids(), ['codex', 'claude'])
+
+    def test_dry_run_does_not_launch_or_remove_entries(self):
+        restored, run = self.restore(live={'claude'}, dry=True)
+        self.assertTrue(restored)
+        run.assert_not_called()
+        self.assertEqual(self.saved_sids(), ['codex', 'claude'])
+
+
+class CodexStartupTests(unittest.TestCase):
+    def run_codex(self, statuses, elapsed=1):
+        results = [app.subprocess.CompletedProcess([], rc) for rc in statuses]
+        times = [v for i in range(len(statuses)) for v in (i * 200, i * 200 + elapsed)]
+        with patch.object(app.subprocess, 'run', side_effect=results) as run, \
+                patch.object(app.time, 'monotonic', side_effect=times), \
+                patch.object(app.time, 'sleep') as sleep, \
+                patch.object(app.shutil, 'which', return_value='/bin/codex'), \
+                patch('builtins.print'):
+            rc = app.run_codex('saved-thread', ['--model', 'selected-model'])
+        return rc, run, sleep
+
+    def test_transient_startup_failure_retries_same_thread_and_flags(self):
+        rc, run, sleep = self.run_codex([1, 1, 0])
+        self.assertEqual(rc, 0)
+        self.assertEqual(run.call_count, 3)
+        for invocation in run.call_args_list:
+            self.assertEqual(invocation.args[0], ['/bin/codex', 'resume', 'saved-thread',
+                                                 '--model', 'selected-model'])
+            self.assertEqual(invocation.kwargs, {})  # stdin/out/err keep their terminal
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10])
+
+    def test_persistent_failure_is_bounded(self):
+        rc, run, sleep = self.run_codex([1, 1, 1])
+        self.assertEqual(rc, 1)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_normal_exit_and_interrupts_do_not_retry(self):
+        for status in (0, -2, -15, 130, 137, 143):
+            with self.subTest(status=status):
+                rc, run, sleep = self.run_codex([status])
+                self.assertEqual(rc, status)
+                run.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_failure_after_long_session_does_not_retry(self):
+        rc, run, sleep = self.run_codex([1], elapsed=app.CODEX_START_SECS)
+        self.assertEqual(rc, 1)
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

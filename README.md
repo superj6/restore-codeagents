@@ -44,5 +44,11 @@ running again. Expired windows are also removed when you run a command, even
 if the watcher is stopped. Cleanup only removes restore entries, not the
 underlying Claude/Codex conversation history.
 
+Opening a terminal does not guarantee its agent started. Saved entries stay
+available until the watcher sees their sessions running, so a Codex bootstrap
+or network error does not lose them. Codex failures within the first 2 minutes
+retry up to 3 attempts, with 5- and 10-second pauses. Normal exits and interrupts
+do not retry; Ctrl-C cancels a pending retry and returns to a shell.
+
 State lives in `~/.local/state/agent-restore/state.json`; watcher logs go to
 `journalctl --user -u agent-restore`.
