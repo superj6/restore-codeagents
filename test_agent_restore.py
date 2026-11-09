@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import agent_restore as app
 
@@ -188,9 +188,8 @@ class RestoreTests(unittest.TestCase):
             json.dump({'closed': [self.entry], 'next_id': 1}, f)
 
     def restore(self, live=(), rc=0, dry=False):
-        result = app.subprocess.CompletedProcess([], rc, stderr='')
         with patch.object(app, 'live_session_ids', return_value=set(live)), \
-                patch.object(app.subprocess, 'run', return_value=result) as run, \
+                patch.object(app, 'open_terminal_window', side_effect=RuntimeError('launch failed') if rc else None) as run, \
                 patch.object(app.os.path, 'isdir', return_value=True), \
                 patch('builtins.print'):
             restored = app.restore([self.entry], dry)
@@ -269,6 +268,127 @@ class CodexStartupTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         run.assert_called_once()
         sleep.assert_not_called()
+
+    def test_queue_time_is_not_counted_as_agent_runtime(self):
+        runner = Mock(side_effect=[(1, 2), (0, 3)])
+        with patch.object(app.time, 'sleep'), patch('builtins.print'):
+            self.assertEqual(app.run_codex('thread', [], runner=runner), 0)
+        self.assertEqual(runner.call_count, 2)
+
+
+class StartupGateTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        p = patch.object(app, 'STATE_DIR', tmp.name)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_low_memory_waits_before_spawning(self):
+        child = Mock()
+        child.poll.return_value = 0
+        child.wait.return_value = 0
+        with patch.object(app, 'available_memory', side_effect=[0, 8 * 1024**3]), \
+                patch.object(app.subprocess, 'Popen', return_value=child) as spawn, \
+                patch.object(app.time, 'sleep', side_effect=lambda _: spawn.assert_not_called()), \
+                patch('builtins.print'):
+            self.assertEqual(app.start_session(['agent'], 'session')[0], 0)
+        spawn.assert_called_once_with(['agent'])
+
+    def test_global_lock_blocks_other_startups(self):
+        with open(os.path.join(app.STATE_DIR, 'startup.lock'), 'w') as held:
+            app.fcntl.flock(held, app.fcntl.LOCK_EX)
+            child = Mock()
+            child.poll.return_value = 0
+            child.wait.return_value = 0
+            with patch.object(app, 'available_memory', return_value=8 * 1024**3), \
+                    patch.object(app.subprocess, 'Popen', return_value=child) as spawn, \
+                    patch('builtins.print'):
+                def release(_):
+                    spawn.assert_not_called()
+                    app.fcntl.flock(held, app.fcntl.LOCK_UN)
+                with patch.object(app.time, 'sleep', side_effect=release):
+                    self.assertEqual(app.start_session(['agent'], 'session')[0], 0)
+            spawn.assert_called_once()
+
+    def test_startup_lock_released_while_loaded_agent_keeps_running(self):
+        child = Mock()
+        child.poll.return_value = None
+        def wait():
+            with open(os.path.join(app.STATE_DIR, 'startup.lock'), 'w') as check:
+                app.fcntl.flock(check, app.fcntl.LOCK_EX | app.fcntl.LOCK_NB)
+            return 0
+        child.wait.side_effect = wait
+        with patch.object(app, 'available_memory', return_value=8 * 1024**3), \
+                patch.object(app.subprocess, 'Popen', return_value=child), \
+                patch.object(app, 'session_tracked', return_value=True), \
+                patch.object(app.time, 'monotonic', side_effect=[0, 5, 40]):
+            self.assertEqual(app.start_session(['agent'], 'session'), (0, 40))
+
+    def test_unavailable_watcher_does_not_hold_queue_forever(self):
+        child = Mock()
+        child.poll.return_value = None
+        child.wait.return_value = 0
+        with patch.object(app, 'available_memory', return_value=8 * 1024**3), \
+                patch.object(app.subprocess, 'Popen', return_value=child), \
+                patch.object(app, 'session_tracked', return_value=False), \
+                patch.object(app.time, 'monotonic', side_effect=[0, 90, 100]):
+            self.assertEqual(app.start_session(['agent'], 'session'), (0, 100))
+
+    def test_repeated_restore_does_not_spawn_duplicate_session(self):
+        def attempt_duplicate(*args, **kwargs):
+            self.assertEqual(app.launch_session('codex', 'same', []), 0)
+            return 0
+        with patch.object(app, 'run_codex', side_effect=attempt_duplicate) as run, patch('builtins.print'):
+            self.assertEqual(app.launch_session('codex', 'same', []), 0)
+            run.assert_called_once()
+
+    def test_cancel_while_waiting_for_memory_spawns_nothing(self):
+        with patch.object(app, 'available_memory', return_value=0), \
+                patch.object(app.time, 'sleep', side_effect=KeyboardInterrupt), \
+                patch.object(app.subprocess, 'Popen') as spawn, patch('builtins.print'):
+            with self.assertRaises(KeyboardInterrupt):
+                app.start_session(['agent'], 'session')
+            spawn.assert_not_called()
+
+
+class TerminalApiTests(unittest.TestCase):
+    def test_tabs_share_window_and_preserve_command_arguments(self):
+        from gi.repository import GLib
+        bus = Mock()
+        bus.call_sync.side_effect = [GLib.Variant('(o)', ('/screen/first',)), None,
+                                     GLib.Variant('(o)', ('/screen/second',)), None]
+        first = dict(tab('first')['agent'], active=False)
+        second = dict(tab('second', 'claude')['agent'], active=True,
+                      flags=['--add-dir', '/path with spaces'])
+        entry = {'geom': {'x': 20, 'y': 30}, 'tabs': [first, second]}
+        with patch.object(app.os.path, 'isdir', return_value=True), \
+                patch.object(app.subprocess, 'run') as cli:
+            app.open_terminal_window(entry, {'EXAMPLE': 'value with spaces'}, bus=bus)
+        cli.assert_not_called()  # the broken multi-tab CLI parser is never used
+        calls = bus.call_sync.call_args_list
+        self.assertEqual(len(calls), 4)
+        create1, create2 = (calls[i].args[4].unpack()[0] for i in (0, 2))
+        self.assertNotIn('window-from-screen', create1)
+        self.assertEqual(create1['geometry'], '+20+30')
+        self.assertEqual(create2['window-from-screen'], '/screen/first')
+        self.assertFalse(create1['active'])
+        self.assertTrue(create2['active'])
+        options, args = calls[3].args[4].unpack()
+        self.assertEqual(bytes(options['cwd']), b'/project\0')
+        self.assertEqual(bytes(options['environ'][0]), b'EXAMPLE=value with spaces\0')
+        command = [bytes(arg).rstrip(b'\0').decode() for arg in args]
+        self.assertEqual(command[:2], ['bash', '-c'])
+        self.assertIn("'" + '/path with spaces' + "'", command[2])
+
+    def test_partial_failure_stops_further_tab_creation(self):
+        from gi.repository import GLib
+        bus = Mock()
+        bus.call_sync.side_effect = [GLib.Variant('(o)', ('/screen/first',)), RuntimeError('spawn failed')]
+        entry = {'tabs': [tab('first')['agent'], tab('second')['agent']]}
+        with self.assertRaisesRegex(RuntimeError, 'spawn failed'):
+            app.open_terminal_window(entry, {}, bus=bus)
+        self.assertEqual(bus.call_sync.call_count, 2)
 
 
 if __name__ == '__main__':

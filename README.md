@@ -17,6 +17,8 @@ want.
 
 Needs GNOME Terminal on Ubuntu/GNOME and the system Python's `gi` + AT-SPI
 bindings (preinstalled there). Re-run `install` if you move this folder.
+Windows are opened through GNOME Terminal's D-Bus API, avoiding the
+intermittent `Can only use --wait once` error in older terminal clients.
 
 ## Use
 
@@ -49,6 +51,14 @@ available until the watcher sees their sessions running, so a Codex bootstrap
 or network error does not lose them. Codex failures within the first 2 minutes
 retry up to 3 attempts, with 5- and 10-second pauses. Normal exits and interrupts
 do not retry; Ctrl-C cancels a pending retry and returns to a shell.
+
+Restored agents queue their startup across all windows instead of loading
+large histories simultaneously. The next agent starts after the watcher
+recognizes the previous session (with a 5-second minimum settling period),
+or after 90 seconds if detection is unavailable. Startup pauses while less
+than 4 GiB of memory is available. This reduces startup pressure but is not
+a memory limit on running agents. Repeated restores cannot start the same
+queued session twice. Ctrl-C in a waiting tab cancels its startup.
 
 State lives in `~/.local/state/agent-restore/state.json`; watcher logs go to
 `journalctl --user -u agent-restore`.

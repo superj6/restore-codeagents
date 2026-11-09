@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,9 @@ EXIT_GRACE_SECS = 30    # agents can exit before their terminal tabs disappear a
 CODEX_START_ATTEMPTS = 3
 CODEX_START_SECS = 120  # retry early failures, not crashes after a long-running session
 CODEX_RETRY_SECS = 5
+STARTUP_WAIT_SECS = 90
+STARTUP_SETTLE_SECS = 5
+MIN_AVAILABLE_BYTES = 4 * 1024 ** 3
 
 # Flags worth carrying over to the resumed session.
 CLAUDE_VALUE_FLAGS = {'--model', '--permission-mode', '--add-dir'}
@@ -648,21 +652,97 @@ def cmd_watch(args):
 # --- restore --------------------------------------------------------------------
 
 def resume_cmd(t):
-    if t['tool'] == 'claude':
-        argv = [shutil.which('claude') or 'claude', '--resume', t['session_id']]
-    else:
-        argv = [sys.executable, os.path.realpath(__file__), '--retry-codex', t['session_id']]
+    argv = [sys.executable, os.path.realpath(__file__), '--launch-session', t['tool'], t['session_id']]
     # Keep the tab open on a shell once the agent exits, like a normal tab.
     return shlex.join(['bash', '-c', shlex.join(argv + t.get('flags', [])) + '; exec "${SHELL:-bash}"'])
 
 
-def run_codex(sid, flags):
+def available_memory():
+    with open('/proc/meminfo') as f:
+        for line in f:
+            if line.startswith('MemAvailable:'):
+                return int(line.split()[1]) * 1024
+    raise RuntimeError('cannot determine available memory')
+
+
+def session_tracked(sid):
+    try:
+        with open(STATE_FILE) as f:
+            st = json.load(f)
+        return any((t.get('agent') or {}).get('session_id') == sid
+                   for w in st.get('layout', []) for t in w['tabs'])
+    except (OSError, ValueError):
+        return False
+
+
+def start_session(argv, sid):
+    """Only one restored agent loads its history at a time, across all windows."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    process = None
+    try:
+        with open(os.path.join(STATE_DIR, 'startup.lock'), 'w') as lock:
+            announced = False
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if not announced:
+                        print('Waiting for another restored tab to finish starting...', flush=True)
+                        announced = True
+                    time.sleep(1)
+            announced = False
+            while available_memory() < MIN_AVAILABLE_BYTES:
+                if not announced:
+                    print('Waiting for at least 4 GiB of available memory. Ctrl-C cancels.', flush=True)
+                    announced = True
+                time.sleep(2)
+            process = subprocess.Popen(argv)
+            started = time.monotonic()
+            while process.poll() is None:
+                elapsed = time.monotonic() - started
+                if elapsed >= STARTUP_WAIT_SECS or (elapsed >= STARTUP_SETTLE_SECS and session_tracked(sid)):
+                    break
+                time.sleep(1)
+        rc = process.wait()
+        return rc, time.monotonic() - started
+    except BaseException:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise
+
+
+def launch_session(tool, sid, flags):
+    # A second restore request must not load the same large history again
+    # while its first tab is still waiting for a startup slot.
+    os.makedirs(STATE_DIR, exist_ok=True)
+    key = hashlib.sha256(f'{tool}:{sid}'.encode()).hexdigest()
+    with open(os.path.join(STATE_DIR, f'session-{key}.lock'), 'w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('This session is already running or queued in another restored tab.', flush=True)
+            return 0
+        if tool == 'codex':
+            return run_codex(sid, flags, runner=lambda argv: start_session(argv, sid))
+        return start_session([shutil.which('claude') or 'claude', '--resume', sid, *flags], sid)[0]
+
+
+def run_codex(sid, flags, runner=None):
     """Retry short failed starts with the real terminal attached throughout."""
     argv = [shutil.which('codex') or 'codex', 'resume', sid, *flags]
     for attempt in range(1, CODEX_START_ATTEMPTS + 1):
-        started = time.monotonic()
-        rc = subprocess.run(argv).returncode
-        elapsed = time.monotonic() - started
+        if runner:
+            rc, elapsed = runner(argv)
+        else:
+            started = time.monotonic()
+            rc = subprocess.run(argv).returncode
+            elapsed = time.monotonic() - started
         if (rc == 0 or rc < 0 or rc in (130, 137, 143) or elapsed >= CODEX_START_SECS
                 or attempt == CODEX_START_ATTEMPTS):
             return rc
@@ -700,8 +780,47 @@ def live_session_ids():
         return {s['session_id'] for s in sessions.claude()}
 
 
+def open_terminal_window(entry, env, bus=None):
+    """Create tabs through GNOME's API, avoiding its multi-tab CLI parser bug."""
+    from gi.repository import Gio, GLib
+    if bus is None:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    def call(path, interface, method, parameters):
+        return bus.call_sync('org.gnome.Terminal', path, interface, method,
+                             parameters, None, Gio.DBusCallFlags.NONE, 10000, None)
+
+    def bytestring(value):
+        return os.fsencode(value) + b'\0'
+
+    parent = None
+    for t in entry['tabs']:
+        options = {'active': GLib.Variant('b', bool(t.get('active')))}
+        if parent:
+            options['window-from-screen'] = GLib.Variant('o', parent)
+        else:
+            geom = entry.get('geom') or {}
+            if geom.get('max'):
+                options['maximize-window'] = GLib.Variant('b', True)
+            elif 'x' in geom:
+                options['geometry'] = GLib.Variant('s', f"+{geom['x']}+{geom['y']}")
+        screen = call('/org/gnome/Terminal/Factory0', 'org.gnome.Terminal.Factory0',
+                      'CreateInstance', GLib.Variant('(a{sv})', (options,))).unpack()[0]
+        parent = parent or screen
+        cwd = t['cwd'] if os.path.isdir(t['cwd']) else HOME
+        options = {'cwd': GLib.Variant('ay', bytestring(cwd)),
+                   'environ': GLib.Variant('aay', [bytestring(f'{k}={v}') for k, v in env.items()]),
+                   'shell': GLib.Variant('b', False)}
+        call(screen, 'org.gnome.Terminal.Terminal0', 'Exec',
+             GLib.Variant('(a{sv}aay)', (options, [bytestring(a) for a in shlex.split(resume_cmd(t))])))
+
+
 def restore(entries, dry):
     env = {k: v for k, v in os.environ.items() if k not in AGENT_ENV}
+    # Restore creates a new window; a stale invoking terminal's D-Bus name
+    # must not pin it to a server that was killed or restarted.
+    env.pop('GNOME_TERMINAL_SERVICE', None)
+    env.pop('GNOME_TERMINAL_SCREEN', None)
     if env.get('GIT_EDITOR') == 'true' and 'CLAUDECODE' in os.environ:  # Claude's, not the user's
         del env['GIT_EDITOR']
     live = live_session_ids()
@@ -722,14 +841,13 @@ def restore(entries, dry):
         for t in c['tabs']:
             if not os.path.isdir(t['cwd']):
                 print(f"  warning: {t['cwd']} no longer exists; opening in ~", file=sys.stderr)
-        r = subprocess.run(argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        noise = [l for l in r.stderr.splitlines() if 'deprecated' not in l and 'Use “-- ”' not in l and l.strip()]
-        if r.returncode == 0:
+        try:
+            open_terminal_window(c, env)
             print(f"opened #{c['id']} ({len(c['tabs'])} tab{'s' * (len(c['tabs']) != 1)}); "
                   'saved until the sessions are detected running')
             opened = True
-        else:
-            print(f"failed to restore #{c['id']}: {' '.join(noise) or r.returncode}", file=sys.stderr)
+        except Exception as e:
+            print(f"failed to restore #{c['id']}: {e}", file=sys.stderr)
     if not dry:
         with state() as st:
             prune(st, live, time.time())
@@ -877,6 +995,7 @@ def main():
     ap = argparse.ArgumentParser(prog='agent-restore', description=__doc__.split('\n\n')[0])
     ap.add_argument('--print', action='store_true', help='print the terminal commands instead of running them')
     ap.add_argument('--retry-codex', nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+    ap.add_argument('--launch-session', nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest='cmd')
     sub.add_parser('list', help='show live and closed windows')
     for name, help_ in (('restore', 'restore closed windows'), ('forget', 'drop closed windows')):
@@ -889,9 +1008,13 @@ def main():
     args = ap.parse_args()
     if args.retry_codex is not None and not args.retry_codex:
         ap.error('--retry-codex requires a session ID')
+    if args.launch_session is not None and (len(args.launch_session) < 2 or args.launch_session[0] not in ('claude', 'codex')):
+        ap.error('--launch-session requires an agent and session ID')
     handler = {None: cmd_pick, 'list': cmd_list, 'restore': cmd_restore, 'forget': cmd_forget,
                'watch': cmd_watch, 'install': cmd_install, 'uninstall': cmd_uninstall}[args.cmd]
     try:
+        if args.launch_session is not None:
+            return launch_session(args.launch_session[0], args.launch_session[1], args.launch_session[2:])
         if args.retry_codex is not None:
             return run_codex(args.retry_codex[0], args.retry_codex[1:])
         return handler(args)
